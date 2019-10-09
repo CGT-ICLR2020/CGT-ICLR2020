@@ -87,7 +87,7 @@ class CGAT(nn.Module):
 
 
 class ClusterBlock(nn.Module):
-    def __init__(self, f0, f1, v, t, k, num_graph=3, alpha=0.2):
+    def __init__(self, f0, f1, v, t, k, num_graph=3, alpha=0.2, atrous_k=2):
         super(ClusterBlock, self).__init__()
         self.f0 = f0  # input dim
         self.f1 = f1  # output dim
@@ -95,27 +95,25 @@ class ClusterBlock(nn.Module):
         self.t = t  # length of input sequence
         self.k = k  # number of cluster
         self.num_graph = num_graph  # number of graphs
-
+        self.atrous_k = atrous_k
         #  soft clustering
-        self.cluster_dense = nn.ModuleList([nn.Linear(t * f0, k, bias=False) for _ in range(num_graph)])
+        self.cluster_dense = nn.ModuleList([nn.Linear(t * f0, k, bias=False) for _ in range(num_graph)]) # for each graph
         for i in range(num_graph):
             nn.init.xavier_normal_(self.cluster_dense[i].weight, gain=1.414)
         self.softmax = nn.Softmax(dim=-1)
 
         #  graph attention for every cluster of the all graph
-        self.GC_layers1 = nn.ModuleList([nn.ModuleList(
-            [CGAT(f0, f1, t, v, attn_type='atrous', atrous_k=2, atrous_offset=0) for _ in range(k)]) for _ in
-            range(num_graph)])
-        self.GC_layers2 = nn.ModuleList([nn.ModuleList(
-            [CGAT(f0, f1, t, v, attn_type='atrous', atrous_k=2, atrous_offset=1) for _ in range(k)]) for _ in
-            range(num_graph)])
-
+        # for each atrous_offset, for each graph, for each cluster
+        self.GC_layers = nn.ModuleList([nn.ModuleList([nn.ModuleList(
+            [CGAT(f0, f1, t, v, attn_type='atrous', atrous_k=atrous_k, atrous_offset=ak) for _ in range(k)]) for _ in
+            range(num_graph)]) for ak in range(atrous_k)])
+        
         self.vt = Variable(torch.FloatTensor(range(self.v)), requires_grad=True)
         self.leakyrelu = nn.LeakyReLU(alpha)
-
+        self.layer_norm = nn.LayerNorm(f1)
+        
     def forward(self, x, graphs):
         """
-
         :param x: (b, v, t, f0)
         :param graphs: List[(v,v)]
         :return: gc_act: (b, v, t, f1)
@@ -125,55 +123,62 @@ class ClusterBlock(nn.Module):
 
         # soft clustering
         xv = x.view(b, self.v, self.t * self.f0)
-        cluster = list(map(lambda cd: self.softmax(cd(xv)), self.cluster_dense))
-
-        assert len(self.GC_layers1) == len(graphs)
-        assert len(self.GC_layers2) == len(graphs)
+        cluster = list(map(lambda cd: self.softmax(cd(xv)), self.cluster_dense)) #(b,v,k)
         gc_out = []
         for i in range(self.num_graph):
             cluster_outputs = []
             for j in range(self.k):
-                gc1 = self.GC_layers1[i][j](x, graphs[i])
-                gc2 = self.GC_layers2[i][j](x, graphs[i])
-                gc = gc1 + gc2
+                gc = sum(self.GC_layers[ak][i][j](x,graphs[i]) for ak in range(self.atrous_k))
                 #  (b*v, t*f1) * (b*v, 1) -> (b*v, t*f1) -> (b, v, t, f1)
                 wgc = (gc.view(b * self.v, self.t * self.f1) * cluster[i][:, :, j].view(b * self.v, 1)).\
                     view(b, self.v, self.t, self.f1)
-                cluster_outputs.append(wgc.unsqueeze(-1))
+                cluster_outputs.append(wgc)
             #  (b, v, t, f1)
-            all_gc_out = torch.sum(torch.stack(cluster_outputs, dim=-1), dim=-1).squeeze(-1)
+            all_gc_out = torch.sum(torch.stack(cluster_outputs, dim=-1), dim=-1)
             gc_out.append(all_gc_out)
         #  the mean of three graphs, (b, v, t, f1)
         gc_act = torch.mean(torch.stack(gc_out, dim=-1), dim=-1)
-
-        return gc_act, cluster
+        return self.layer_norm(gc_act), cluster
 
 
 #  multi-head attention
 class MultiHeadAttention(nn.Module):
     """
     A multi-head attention module.
+    f0 = (q_0,k_0,v_0)
+    f_hid = (q_hid,k_hid,v_hid)
+    f1 = f_v_out
     """
-    def __init__(self, n_head, d_model_in, d_model_out, d_k, d_v, alpha=0.2):
+    def __init__(self, f0, f_hid, f1, alpha=0.2):
         super().__init__()
-        assert d_model_out == n_head * d_k
-        self.n_head = n_head
-        self.d_k = d_k
-        self.d_v = d_v
+        self.f0 = f0
+        self.f1 = f1
+        self.f_hid = f_hid
+        
+        self.q_0 = f0[0]
+        self.k_0 = f0[1]
+        self.v_0 = f0[2]
+        
+        self.q_h = f_hid[0]
+        self.k_h = f_hid[1]
+        self.v_h = f_hid[2]
+        assert self.q_h == self.k_h
+        
         self.alpha = alpha
         self.leakyrelu = nn.LeakyReLU(alpha)
 
-        self.w_qs = nn.Linear(d_model_out, n_head * d_k, bias=False)
-        self.w_ks = nn.Linear(d_model_in, n_head * d_k, bias=False)
-        self.w_vs = nn.Linear(d_model_in, n_head * d_v, bias=False)
-        nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model_in + d_k)))
-        nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model_in + d_k)))
-        nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model_in + d_v)))
+        self.w_qs = nn.Linear(self.q_0, self.q_h, bias=False)
+        self.w_ks = nn.Linear(self.k_0, self.k_h, bias=False)
+        self.w_vs = nn.Linear(self.v_0, self.v_h, bias=False)
+        nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (self.q_0+self.q_h)))
+        nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (self.k_0+self.k_h)))
+        nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (self.v_0+self.v_h)))
 
-        self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
-        self.fc = nn.Linear(n_head * d_v, d_model_out, bias=False)
+        self.attention = ScaledDotProductAttention(temperature=np.power(self.q_h, 0.5))
+        self.fc = nn.Linear(self.v_h, self.f1, bias=False)
         nn.init.xavier_normal_(self.fc.weight)
-
+        self.layer_norm = nn.LayerNorm(f1)
+        
     def forward(self, q, k, v, mask=None):
         """
         MultiHeadAttention operation
@@ -181,29 +186,19 @@ class MultiHeadAttention(nn.Module):
         :param k: (b, t, d_k)
         :param v: (b, v, t, d_v)
         :param mask:
-        :return: (b, v, t, d_model_out)
+        :return: (b, v, t, f1)
         """
-        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
-        sz_b_q, len_q, d0_q = q.size()
-        sz_b_k, len_k, d0_k = k.size()
-        sz_b_v, n_v, len_v, d0_v = v.size()
-
-        #  multi-head attention
-        q = self.w_qs(q).view(sz_b_q, len_q, -1).contiguous().view(sz_b_q, len_q, n_head, d_k)
-        k = self.w_ks(k).view(sz_b_k, len_k, -1).contiguous().view(sz_b_k, len_k, n_head, d_k)
-        v = self.w_vs(v).view(sz_b_v, n_v, len_v, n_head, d_v)
-        q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k)  # (b * nhead) x lq x dk
-        k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k, d_k)  # (b * nhead) x lk x dk
-        v = v.permute(3, 0, 1, 2, 4).contiguous().view(-1, n_v, len_v, d_v)  # (n_head*b) x n_v x lv x dv
-        if mask is not None:
-            mask = mask.repeat(n_head, 1, 1)
-        output, attn = self.attention(q, k, v, mask=mask)
-        output = output.view(n_head, sz_b_v, n_v, len_q, d_v)
-        output = output.permute(1, 2, 3, 4, 0).contiguous().view(sz_b_v, n_v, len_q, n_head * d_v)
-
+        b_q, t_q, f_q = q.size()
+        b_k, t_k, f_k = k.size()
+        b_v, v_v, t_v, f_v = v.size()
+        assert b_q == b_k == b_v
+        assert f_q == self.q_0
+        assert f_k == self.k_0
+        assert f_v == self.v_0
+        output, attn = self.attention(self.w_qs(q), self.w_ks(k), self.w_vs(v), mask=mask)
+        output = output.view(b_v,v_v,t_q,self.v_h).contiguous()
         output = self.leakyrelu(self.fc(output))
-
-        return output, attn
+        return self.layer_norm(output), attn
 
 
 class PositionWiseFeedForward(nn.Module):
@@ -211,11 +206,11 @@ class PositionWiseFeedForward(nn.Module):
     A position wise feed forward module.
     Project the dim of input to d_hid, and then to d_in back.
     """
-    def __init__(self, d_in, d_hid, alpha=0.2):
+    def __init__(self, d_in, d_hid,d_out, alpha=0.2):
         super().__init__()
         self.alpha = alpha
         self.w_1 = nn.Linear(d_in, d_hid, bias=False)
-        self.w_2 = nn.Linear(d_hid, d_in, bias=False)
+        self.w_2 = nn.Linear(d_hid, d_out, bias=False)
 
         nn.init.xavier_normal_(self.w_1.weight, gain=1.414)
         nn.init.xavier_normal_(self.w_2.weight, gain=1.414)
@@ -266,10 +261,10 @@ class EncoderLayer(nn.Module):
     Encoder layer.
     Compose with two layers: multi-head attention and ffc.
     """
-    def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.5):
+    def __init__(self, f0, f_hid, f1, dropout=0.5):
         super(EncoderLayer, self).__init__()
-        self.slf_attn = MultiHeadAttention(n_head, d_model, d_model, d_k, d_v)
-        self.pos_ffn = PositionWiseFeedForward(d_model, d_inner)
+        self.slf_attn = MultiHeadAttention(f0=(f0,f0,f0), f_hid=(f_hid,f_hid,f_hid), f1 = f1)
+        self.pos_ffn = PositionWiseFeedForward(d_in = f1,d_hid = f1*2,d_out = f1)
 
     def forward(self, enc_input_qk, enc_input_v, slf_attn_mask=None):
         enc_output, enc_slf_attn = self.slf_attn(enc_input_qk, enc_input_qk, enc_input_v, mask=slf_attn_mask)
@@ -282,20 +277,17 @@ class DecoderLayer(nn.Module):
     Decoder layer.
     Compose with three layers: multi-head attention, enc-dec attention and ffc.
     """
-
-    def __init__(self, enc_f, y_f, d_inner, n_head, d_k, d_v, dropout=0.5):
+    def __init__(self, f0, enc_f0, f_hid, f1,dropout=0.5):
         super(DecoderLayer, self).__init__()
-        self.slf_attn = MultiHeadAttention(n_head, y_f, y_f, d_k, d_v)
-        self.enc_attn = MultiHeadAttention(n_head, enc_f, y_f, d_k, d_v)
-        self.pos_ffn = PositionWiseFeedForward(y_f, d_inner)
+        self.slf_attn = MultiHeadAttention(f0=(f0,f0,f0),f_hid = (f_hid,f_hid,f_hid),f1=f_hid)
+        self.enc_attn = MultiHeadAttention(f0=(f_hid,enc_f0,enc_f0),f_hid = (f_hid,f_hid,f_hid),f1=f1)
+        self.pos_ffn = PositionWiseFeedForward(d_in = f1,d_hid = f1*2,d_out = f1)
 
-    def forward(self, dec_input_qk, dec_input_v, enc_output, slf_attn_mask=None):
+    def forward(self, dec_input_qk, dec_input_v, enc_output_qk, enc_output_v, slf_attn_mask=None):
         dec_output, dec_slf_attn = self.slf_attn(dec_input_qk, dec_input_qk, dec_input_v, mask=slf_attn_mask)
         #  Flat the dim v
         dec_output_flat = torch.mean(dec_output, 1)
-        enc_output_flat = torch.mean(enc_output, 1)
-
-        dec_output, dec_enc_attn = self.enc_attn(dec_output_flat, enc_output_flat, enc_output, mask=None)
+        dec_output, dec_enc_attn = self.enc_attn(dec_output_flat, enc_output_qk, enc_output_v, mask=None)
         dec_output = self.pos_ffn(dec_output)
         return dec_output, dec_slf_attn, dec_enc_attn
 
@@ -315,32 +307,28 @@ def get_subsequent_mask(seq):
 class Encoder(nn.Module):
     """
     The encoder with self attention mechanism of transformer.
+    io_list = [[input,gc_out/attn_in,attn_hid,attn_out],...,[]]
+    io_list=[[5,8,16,16],[16,32,32,16],[16,16,16,16]]
+    toy example: io_list=[[5,8,8,8],[8,8,8,8]]
     """
-    def __init__(self, v, t, k_cluster, n_layers, n_head, d_inner, out_dim_list, pe_dim=5, alpha=0.2):
+    def __init__(self, v, t, k_cluster, n_layers, io_list, pe_dim=5, alpha=0.2):
         super().__init__()
-        assert n_layers == len(out_dim_list)
-
+        assert n_layers == len(io_list)
+        assert io_list[0][0] == pe_dim
+        
         #  generate input-output dim list of multi layers.
-        self.io_list = [[pe_dim - 1, pe_dim - 1]]
-        self.tf_io_list = [[pe_dim - 1, out_dim_list[0]]]
-        for i in range(1, n_layers):
-            self.io_list.append([out_dim_list[i-1], out_dim_list[i]])
-            self.tf_io_list.append([out_dim_list[i - 1], out_dim_list[i]])
-
+        self.pe_dim = pe_dim
+        self.io_list = io_list
         self.n_layers = n_layers
         #  cluster graph attention module stack.
         self.cluster_block = nn.ModuleList(
             list(map(lambda x: ClusterBlock(x[0], x[1], v, t, k_cluster), self.io_list))
         )
-        self.pe_dim = pe_dim
-        self.pos_enc_qk = nn.Linear(pe_dim, self.io_list[1][0])
-        self.pos_enc_v = nn.Linear(pe_dim, self.io_list[1][0])
-        self.leakyrelu = nn.LeakyReLU(alpha)
         #  encoder layer module stack.
         self.layer_stack = nn.ModuleList(
-            list(map(lambda x: EncoderLayer(x[1], d_inner, n_head, x[1] // n_head, x[1] // n_head),
-                     self.tf_io_list))
+            list(map(lambda x: EncoderLayer(x[1],x[2],x[3]), self.io_list))
         )
+        self.leakyrelu = nn.LeakyReLU(alpha)
 
     def forward(self, x_d, x_pe, graph, return_attns=False):
         """
@@ -350,44 +338,23 @@ class Encoder(nn.Module):
         :param return_attns: boolean
         :return: (b, v, t, f)
         """
-        sz_b, v, t, f = x_d.size()
+        b, v, t, f = x_d.size()
         enc_slf_attn_list = []
         cluster_mat = []
 
         #  get position encoding, pe: (B,T) f 0-3 periodicty, 4 trend qk, 5 trend v
-        qk_ = x_pe[:, :, -2].unsqueeze(-1)
-        v_ = x_pe[:, :, -1].unsqueeze(-1)
-        x_qk = torch.mean(x_d, dim=1) + qk_
-        x_v = (x_d.permute(1, 0, 2, 3).contiguous() + v_).permute(1, 0, 2, 3).contiguous()
 
-        inputs = x_d.repeat(1, 1, 1, self.pe_dim - 1)  # (b, v, t, 4)
-        periodicity = x_pe[:, :, :4]
-        inputs = (inputs.permute(1, 0, 2, 3).contiguous() + periodicity).\
-            permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
+        inputs = x_d.repeat(1, 1, 1, self.pe_dim)  # (b, v, t, 5)
+        inputs = (inputs.permute(1, 0, 2, 3).contiguous() + x_pe).permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
 
-        #  cluster graph attention
-        inputs, cluster = self.cluster_block[0](inputs, graph)  # (b,v,t,4), (b,v,k)
-        cluster_mat.append(cluster)
-        #  flat the dim v
-        inputs_flat = torch.mean(inputs, dim=1)  # (b, t, f)
-        #  encoder layer
-        enc_input_qk = torch.cat([inputs_flat, x_qk], dim=-1)
-        enc_input_v = torch.cat([inputs, x_v], dim=-1)
-        enc_input_qk = self.leakyrelu(self.pos_enc_qk(enc_input_qk))
-        enc_input_v = self.leakyrelu(self.pos_enc_v(enc_input_v))
-        enc_output, enc_slf_attn = self.layer_stack[0](enc_input_qk, enc_input_v)  # (b, v, t, f2)
-        if return_attns:
-            enc_slf_attn_list += [enc_slf_attn]
-
-        for i in range(1, self.n_layers):
+        enc_output = inputs
+        for i in range(0, self.n_layers):
             ccb_layer = self.cluster_block[i]
             enc_layer = self.layer_stack[i]
             enc_output, cluster = ccb_layer(enc_output, graph)
             cluster_mat.append(cluster)
-            enc_output = enc_output.view(sz_b, v, t, -1)
             enc_output_flat = torch.mean(enc_output, dim=1)
             enc_output, enc_slf_attn = enc_layer(enc_output_flat, enc_output)
-
             if return_attns:
                 enc_slf_attn_list += [enc_slf_attn]
 
@@ -399,37 +366,30 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """
     The decoder with attention mechanism of transformer.
+    io_list=[[5,8,16,16],[16,8,8,8],[8,8,8,8]]
+    toy example: io_list=[[5,8,8,8],[8,8,8,8]]
     """
 
-    def __init__(self, v, t, k_cluster, n_layers, n_head, d_inner, out_dim_list, enc_f=8, y_d_f=1, pe_dim=5, alpha=0.2):
+    def __init__(self, v, t, k_cluster, n_layers, io_list, enc_f, pe_dim=5, alpha=0.2):
         super().__init__()
-        assert n_layers == len(out_dim_list)
+        assert n_layers == len(io_list)
 
         #  generate input-output dim list of multi layers.
-        self.io_list = [[pe_dim - 1, pe_dim - 1]]
-        self.tf_io_list = [[pe_dim - 1, out_dim_list[0]]]
-        for i in range(1, n_layers):
-            self.io_list.append([out_dim_list[i - 1], out_dim_list[i]])
-            self.tf_io_list.append([out_dim_list[i - 1], out_dim_list[i]])
-
+        self.io_list = io_list
+        self.pe_dim = pe_dim
         self.n_layers = n_layers
+        self.enc_f = enc_f
         #  cluster graph attention module stack.
         self.cluster_block = nn.ModuleList(
             list(map(lambda x: ClusterBlock(x[0], x[1], v, t, k_cluster), self.io_list))
         )
-        self.enc_f = enc_f
-        self.y_d_f = y_d_f
-        self.pe_dim = pe_dim
-        self.pos_dec_qk = nn.Linear(pe_dim, self.io_list[1][0])
-        self.pos_dec_v = nn.Linear(pe_dim, self.io_list[1][0])
-        self.leakyrelu = nn.LeakyReLU(alpha)
         #  decoder layer module stack.
         self.layer_stack = nn.ModuleList(
-            list(map(
-                lambda x: DecoderLayer(enc_f, x[1], d_inner, n_head, x[1] // n_head, x[1] // n_head),
-                self.tf_io_list))
+            list(map(lambda x: DecoderLayer(x[1],self.enc_f,x[2],x[3]),self.io_list))
         )
+        self.leakyrelu = nn.LeakyReLU(alpha)
 
+        
     def forward(self, x_d, x_pe, enc_output, graph, return_attns=False):
         """
         :param x_d: target signal, shape: (b, v, t, f)
@@ -444,46 +404,25 @@ class Decoder(nn.Module):
         dec_slf_attn_list = []
         dec_enc_attn_list = []
 
-        #  get position encoding, pe: (B,T) f 0-3 periodicty, 4 trend qk, 5 trend v
-        qk_ = x_pe[:, :, -2].unsqueeze(-1)
-        v_ = x_pe[:, :, -1].unsqueeze(-1)
-        x_qk = torch.mean(x_d, dim=1) + qk_
-        x_v = (x_d.permute(1, 0, 2, 3).contiguous() + v_).permute(1, 0, 2, 3).contiguous()
+        #  get position encoding, pe: (B,T) f 0-3 periodicty, 4 trend qk, 5 trend v        
+        inputs = x_d.repeat(1, 1, 1, self.pe_dim)  # (b, v, t, 5)
+        inputs = (inputs.permute(1, 0, 2, 3).contiguous() + x_pe).permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
 
-        inputs = x_d.repeat(1, 1, 1, self.pe_dim - 1)  # (b, v, t, 4)
-        periodicity = x_pe[:, :, :4]
-        inputs = (inputs.permute(1, 0, 2, 3).contiguous() + periodicity).\
-            permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
-
-        #  cluster graph attention
-        inputs, cluster = self.cluster_block[0](inputs, graph)  # (b,v,t,4), (b,n,k)
-        cluster_mat.append(cluster)
-        #  flat the dim v
-        inputs_flat = torch.mean(inputs, dim=1)  # (b, t, f)
-        #  decoder layer
-        dec_input_qk = torch.cat([inputs_flat, x_qk], dim=-1)
-        dec_input_v = torch.cat([inputs, x_v], dim=-1)
-        dec_input_qk = self.leakyrelu(self.pos_dec_qk(dec_input_qk))
-        dec_input_v = self.leakyrelu(self.pos_dec_v(dec_input_v))
-
+        enc_output_qk = torch.mean(enc_output, dim=1)
+        enc_output_v = enc_output
         slf_attn_mask_subseq = get_subsequent_mask(x_d)  # b,t,t
-        dec_output, dec_slf_attn, dec_enc_attn = self.layer_stack[0](dec_input_qk, dec_input_v,
-                                                                     enc_output, slf_attn_mask_subseq)
-        if return_attns:
-            dec_slf_attn_list += [dec_slf_attn]
-            dec_enc_attn_list += [dec_enc_attn]
 
-        for i in range(1, self.n_layers):
+        dec_output = inputs
+        for i in range(0, self.n_layers):
             ccb_layer = self.cluster_block[i]
             dec_layer = self.layer_stack[i]
-
+            
             dec_output, cluster = ccb_layer(dec_output, graph)
             cluster_mat.append(cluster)
             dec_output = dec_output.view(b, v, t, -1)
             dec_output_flat = torch.mean(dec_output, dim=1)
-
             dec_output, dec_slf_attn, dec_enc_attn = dec_layer(dec_output_flat, dec_output,
-                                                               enc_output, slf_attn_mask_subseq)
+                                                               enc_output_qk, enc_output_v, slf_attn_mask_subseq)
             if return_attns:
                 dec_slf_attn_list += [dec_slf_attn]
                 dec_enc_attn_list += [dec_enc_attn]
@@ -497,18 +436,19 @@ class CGT(nn.Module):
     """
     A clustered graph transformer model for spatio-temporal predicting.
     """
-    def __init__(self, v, x_t, y_t, k_cluster, d_inner, n_layers,
-                 n_head_enc, n_head_dec, out_dim_list, output_dim=1, pe_dim=5, alpha=0.2):
+    def __init__(self, v, x_t, y_t, k_cluster, n_layers, output_dim=1, pe_dim=5, alpha=0.2):
         super(CGT, self).__init__()
         self.v = v
-        self.encoder = Encoder(v=v, t=x_t, k_cluster=k_cluster, n_layers=n_layers, n_head=n_head_enc, d_inner=d_inner,
-                               out_dim_list=out_dim_list, pe_dim=pe_dim, alpha=alpha)
+        
+        self.enc_io_list = [[5,8,16,16],[16,32,32,16],[16,16,16,16]]
+        self.dec_io_list = [[5,8,16,16],[16,16,16,16],[16,8,8,8]]
+        
+        self.encoder = Encoder(v=v, t=x_t, k_cluster=k_cluster, io_list = self.enc_io_list, n_layers=n_layers, pe_dim=pe_dim, alpha=alpha)
 
-        self.decoder = Decoder(v=v, t=y_t, k_cluster=k_cluster, n_layers=n_layers, n_head=n_head_dec, d_inner=d_inner,
-                               out_dim_list=out_dim_list, enc_f=out_dim_list[-1], y_d_f=output_dim, pe_dim=pe_dim, alpha=alpha)
+        self.decoder = Decoder(v=v, t=y_t, k_cluster=k_cluster, io_list = self.dec_io_list, enc_f = self.enc_io_list[-1][-1], n_layers=n_layers, pe_dim=pe_dim, alpha=alpha)
 
         self.hid_dim = self.decoder.io_list[-1][-1]
-        self.aggregate = nn.Linear(self.hid_dim, output_dim)
+        self.aggregate = nn.Linear(self.hid_dim, output_dim,bias=True)
         self.leakyrelu = nn.LeakyReLU(alpha)
 
     def forward(self, x_d, x_pe, y_d, y_pe, graph):
