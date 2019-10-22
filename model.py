@@ -333,7 +333,7 @@ class Encoder(nn.Module):
     def forward(self, x_d, x_pe, graph, return_attns=False):
         """
         :param x_d: input signal, shape: (b, v, t, f)
-        :param x_pe: position encoding, shape: (b, t, 6)
+        :param x_pe: position encoding, shape: (b, t, 5)
         :param graph: list of adjacent matrix
         :param return_attns: boolean
         :return: (b, v, t, f)
@@ -342,7 +342,7 @@ class Encoder(nn.Module):
         enc_slf_attn_list = []
         cluster_mat = []
 
-        #  get position encoding, pe: (B,T) f 0-3 periodicty, 4 trend qk, 5 trend v
+        #  get position encoding, pe: (B,T) f 0-4 for periodicity (the sin/cos functions), 5 for closeness (the exp function)
 
         inputs = x_d.repeat(1, 1, 1, self.pe_dim)  # (b, v, t, 5)
         inputs = (inputs.permute(1, 0, 2, 3).contiguous() + x_pe).permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
@@ -393,7 +393,7 @@ class Decoder(nn.Module):
     def forward(self, x_d, x_pe, enc_output, graph, return_attns=False):
         """
         :param x_d: target signal, shape: (b, v, t, f)
-        :param x_pe: position encoding, shape: (b, t, 6)
+        :param x_pe: position encoding, shape: (b, t, 5)
         :param enc_output: the output of encoder, shape: (b, v, t, f)
         :param graph: list of adjacent matrix
         :param return_attns: boolean
@@ -404,7 +404,7 @@ class Decoder(nn.Module):
         dec_slf_attn_list = []
         dec_enc_attn_list = []
 
-        #  get position encoding, pe: (B,T) f 0-3 periodicty, 4 trend qk, 5 trend v        
+        #  get position encoding, pe: (B,T) f 0-4 for periodicity (the sin/cos functions), 5 for closeness (the exp function)
         inputs = x_d.repeat(1, 1, 1, self.pe_dim)  # (b, v, t, 5)
         inputs = (inputs.permute(1, 0, 2, 3).contiguous() + x_pe).permute(1, 0, 2, 3).contiguous()  # (b, v, t, f)
 
@@ -454,9 +454,9 @@ class CGT(nn.Module):
     def forward(self, x_d, x_pe, y_d, y_pe, graph):
         """
         :param x_d: (b, v, x_t, f_in)
-        :param x_pe: (b, x_t, 6)
+        :param x_pe: (b, x_t, 5)
         :param y_d: (b, v, y_t, f_out)
-        :param y_pe: (b, y_t, 6)
+        :param y_pe: (b, y_t, 5)
         :param graph: [num_graph, v, v]
         :return: (b, v, y_t, f_out)
         """
